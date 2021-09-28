@@ -3,70 +3,102 @@ package nats
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"natsreg/registry"
-	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 )
 
-type Registry struct {
+const (
+	RegisterSubj = "register_service"
+)
+
+type natsReg struct {
 	state *state
 	conn  *nats.Conn
+	wg    sync.WaitGroup
 }
 
-func (r *Registry) Conn() *nats.Conn {
+// GetConn returns a connection to the configured NATS registry.
+func (r *natsReg) GetConn() *nats.Conn {
 	return r.conn
 }
 
-func (r *Registry) Subscribe() {
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+// Register adds a node to the registry by sending a RegisterSubj message to the bus.
+func (r *natsReg) Register(n registry.Node) error {
+	log.Println(fmt.Sprintf("node registered: %+v", n))
+	b, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
 
-	go func() {
-		_, err := r.conn.Subscribe("register_service", func(m *nats.Msg) {
-			node := registry.Node{}
-			if err := json.Unmarshal(m.Data, &node); err != nil {
-				panic(err)
-			}
+	if err := r.conn.Publish(RegisterSubj, b); err != nil {
+		return err
+	}
 
-			r.state.nodes = append(r.state.nodes, node)
-
-			fmt.Printf("Received a message: %+v\n", node)
-		})
-		if err != nil {
-			panic(err)
-		}
-	}()
-
-	<-stop
+	return nil
 }
 
-func (r *Registry) ListNodes() []registry.Node {
+// ListNodes lists all the registered nodes on the registry.
+func (r *natsReg) ListNodes() []*registry.Node {
 	return r.state.GetNodes()
 }
 
 // New returns a configured nats registry.
-func New() registry.Registry {
+// It will fail if the NATS server is incorrectly configured.
+func New() (registry.Registry, error) {
 	c, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	return &Registry{
+	r := natsReg{
 		state: &state{
-			nodes: []registry.Node{},
+			nodes: []*registry.Node{},
 		},
 		conn: c,
+		wg:   sync.WaitGroup{},
 	}
+
+	return &r, nil
 }
 
-// ugly. decouple state from this. we need more persistent storage anyway
-type state struct {
-	nodes []registry.Node
+// Start a registry service. This operation blocks, use in a go routine.
+// listen for services registration on the "register_service" subject.
+func (r *natsReg) Start() error {
+	r.wg.Add(1)
+	_, err := r.conn.Subscribe(RegisterSubj, func(m *nats.Msg) {
+		n, err := formatNode(m.Data)
+		if err != nil {
+			log.Printf("invalid message: [%s]", err.Error())
+		}
+
+		r.state.Append(n)
+	})
+	if err != nil {
+		return err
+	}
+
+	r.wg.Wait()
+	return nil
 }
 
-func (s *state) GetNodes() []registry.Node {
-	return s.nodes
+// Shutdown stops the registry service.
+func (r *natsReg) Shutdown() {
+	{
+		r.wg.Done()
+		r.conn.Close()
+	}
+	log.Println("shutting down NATS registry...")
+}
+
+// formatNode creates a node from a []byte.
+func formatNode(b []byte) (*registry.Node, error) {
+	node := registry.Node{}
+	if err := json.Unmarshal(b, &node); err != nil {
+		return nil, err
+	}
+
+	return &node, nil
 }

@@ -2,46 +2,46 @@ package echoer
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"natsreg/registry"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/nats-io/nats.go"
+	"github.com/google/uuid"
 )
-
-// echoer is a service that echoes whatever it is in the URL
 
 // Run starts an echoer service that registers itself.
 func Run(r registry.Registry) {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 
-	go func() {
-		nc, err := nats.Connect(nats.DefaultURL)
-		if err != nil {
-			panic(err)
-		}
+	// https://stackoverflow.com/questions/43424787/how-to-use-next-available-port-in-http-listenandserve/43425461
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		panic(err)
+	}
 
-		if err := nc.Publish("register_service", []byte("{\"Name\": \"echoer-45495056-1f95-11ec-9f9f-3758f4a85c33\",\"Addr\": \"127.0.0.1:7766\"}")); err != nil {
-			panic(err)
-		}
+	log.Println("echoer listening on", listener.Addr().String())
 
-		if err := nc.Publish("register_service", []byte("{\"Name\": \"echoer-2-45495056-1f95-11ec-9f9f-3758f4a85c33\",\"Addr\": \"127.0.0.1:7766\"}")); err != nil {
-			panic(err)
-		}
-	}()
+	if err := r.Register(registry.Node{
+		Name: fmt.Sprintf("%s-%s", "echoer", uuid.New().String()),
+		Addr: listener.Addr().String(),
+	}); err != nil {
+		panic(err)
+	}
 
-	go serve(r)
+	go serve(r, listener)
 	<-stop
 }
 
-func serve(r registry.Registry) {
+func serve(r registry.Registry, listener net.Listener) {
 	http.HandleFunc("/list", listNodesHandler(r))
 	http.HandleFunc("/register", registerNodeHandler(r))
-	log.Fatal(http.ListenAndServe(":7766", nil))
+	log.Fatal(http.Serve(listener, nil))
 }
 
 func listNodesHandler(reg registry.Registry) http.HandlerFunc {
@@ -75,13 +75,18 @@ func registerNodeHandler(reg registry.Registry) http.HandlerFunc {
 		address := r.Form.Get("address")
 
 		n := &registry.Node{
-			Name: name,
+			Name: fmt.Sprintf("%s-%s", name, uuid.New().String()),
 			Addr: address,
 		}
 
 		_, err := json.Marshal(n)
 		if err != nil {
 			println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		if err := reg.Register(*n); err != nil {
+			log.Println("could not register node", n)
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}
